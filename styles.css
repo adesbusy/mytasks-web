@@ -73,6 +73,10 @@ html[data-theme="light"] {
 
 html, body { height: 100%; }
 
+/* Lock the viewport itself: the app scrolls internally (task list, groups),
+   so a page-level scrollbar — especially horizontal — must never appear. */
+html { overflow: hidden; }
+
 body {
   margin: 0;
   font-family: var(--font);
@@ -949,6 +953,7 @@ html[data-theme="light"] .check.on::after { border-color: #fff; }
   flex: none;
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 14px;
   padding: 10px 6px 12px;
   border-top: 1px solid var(--border-soft);
@@ -1026,7 +1031,8 @@ html[data-theme="light"] .check.on::after { border-color: #fff; }
   .save-status { padding: 0 8px; gap: 6px; }
   .save-time { display: none; }
 
-  /* Sidebar becomes an off-canvas drawer. */
+  /* Sidebar becomes an off-canvas drawer. When closed it is hidden entirely
+     (visibility) so it can't sit off-screen and create horizontal scrolling. */
   #sidebar {
     position: fixed;
     top: var(--titlebar-h);
@@ -1035,10 +1041,15 @@ html[data-theme="light"] .check.on::after { border-color: #fff; }
     width: min(84vw, 320px);
     z-index: 60;
     transform: translateX(105%);
-    transition: transform .24s ease;
+    visibility: hidden;
+    transition: transform .24s ease, visibility 0s linear .24s;
     box-shadow: var(--shadow);
   }
-  body.nav-open #sidebar { transform: translateX(0); }
+  body.nav-open #sidebar {
+    transform: translateX(0);
+    visibility: visible;
+    transition: transform .24s ease, visibility 0s;
+  }
   body.nav-open .nav-scrim { opacity: 1; pointer-events: auto; }
 
   #main { padding: 0 12px; }
