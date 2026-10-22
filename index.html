@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'">
+  <title>משימות שלי — גרסת דפדפן</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="titlebar" class="titlebar">
+    <div class="titlebar-inner">
+      <div class="tb-brand">
+        <span class="logo" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.4"
+               stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4.5 12.5l4 4L19.5 5.5"></path>
+          </svg>
+        </span>
+        <span class="tb-title">משימות שלי</span>
+        <span class="tb-web-badge">Web</span>
+      </div>
+      <div class="tb-tools">
+        <span id="save-status" class="save-status" data-state="idle" title="השמירה האוטומטית פעילה">
+          <span class="save-dot"></span><span class="save-text">נשמר</span><span class="save-time" id="save-time"></span>
+        </span>
+        <button id="theme-toggle" class="icon-btn tb-btn" title="החלפת ערכת נושא" aria-label="החלפת ערכת נושא"></button>
+      </div>
+    </div>
+  </div>
+
+  <div id="app">
+    <aside id="sidebar">
+      <div class="side-top">
+        <button id="add-task-btn" class="btn primary block">
+          <span class="plus">+</span> משימה חדשה
+        </button>
+      </div>
+
+      <nav id="views" class="views" aria-label="תצוגות"></nav>
+
+      <div class="side-section-head">
+        <span class="side-section-title">קבוצות</span>
+        <button id="add-group-btn" class="icon-btn tiny" title="קבוצה חדשה" aria-label="הוספת קבוצה">+</button>
+      </div>
+
+      <form id="new-group-form" class="new-group hidden" autocomplete="off">
+        <input id="new-group-input" class="new-group-input" placeholder="שם הקבוצה…" maxlength="60" data-fk="new-group">
+        <button type="submit" class="btn tiny">אישור</button>
+      </form>
+
+      <ul id="group-list" class="group-list"></ul>
+
+      <div class="side-footer">
+        <div class="side-footer-row">
+          <button id="export-btn" class="link-btn" title="ייצוא כל הנתונים לקובץ JSON">ייצוא</button>
+          <span class="dot-sep">·</span>
+          <button id="import-btn" class="link-btn" title="ייבוא נתונים מקובץ JSON">ייבוא</button>
+          <span class="dot-sep">·</span>
+          <button id="open-folder-btn" class="link-btn" title="הנתונים נשמרים בדפדפן זה בלבד">נתונים בדפדפן</button>
+        </div>
+        <div class="side-footer-row subtle">
+          <span id="save-path" class="save-path" title=""></span>
+          <span id="version" class="version"></span>
+        </div>
+      </div>
+    </aside>
+
+    <main id="main">
+      <header id="view-head" class="view-head">
+        <div class="view-title-wrap">
+          <h1 id="view-title">כל המשימות</h1>
+          <div id="view-sub" class="view-sub"></div>
+        </div>
+        <div class="view-tools">
+          <div class="search-wrap">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="11" cy="11" r="7"></circle>
+              <path d="M20 20l-3.2-3.2"></path>
+            </svg>
+            <input id="search" class="search" type="search" placeholder="חיפוש משימות…" autocomplete="off" data-fk="search">
+          </div>
+          <select id="sort" class="select sort" title="סידור המשימות" aria-label="סידור המשימות"></select>
+        </div>
+      </header>
+
+      <form id="quick-add-form" class="quick-add" autocomplete="off">
+        <input id="quick-add-input" class="quick-add-input" placeholder="הוספת משימה — הקלד ולחץ Enter" maxlength="500" data-fk="quick-add">
+        <select id="quick-add-group" class="select" title="קבוצת המשימה" aria-label="קבוצת המשימה"></select>
+        <input id="quick-add-due" class="date-input" type="date" title="תאריך יעד (אופציונלי)" aria-label="תאריך יעד">
+        <button type="submit" class="btn primary">הוספה</button>
+      </form>
+
+      <div id="task-list" class="task-list"></div>
+
+      <div id="empty-state" class="empty-state hidden"></div>
+
+      <footer id="stats" class="stats"></footer>
+    </main>
+  </div>
+
+  <dialog id="confirm-dialog" class="dialog">
+    <form method="dialog" class="dialog-inner">
+      <h2 id="confirm-title" class="dialog-title">אישור</h2>
+      <p id="confirm-body" class="dialog-body"></p>
+      <div class="dialog-actions">
+        <button id="confirm-cancel" value="cancel" class="btn ghost">ביטול</button>
+        <button id="confirm-ok" value="ok" class="btn danger">מחיקה</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+  <script src="bridge.js"></script>
+  <script src="renderer.js"></script>
+</body>
+</html>
