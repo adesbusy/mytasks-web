@@ -996,3 +996,104 @@ html[data-theme="light"] .check.on::after { border-color: #fff; }
   margin-inline-start: 2px;
   user-select: none;
 }
+
+/* --------------------------------------------------- responsive (mobile) */
+
+.nav-toggle {
+  display: none;
+  -webkit-app-region: no-drag;
+}
+
+.nav-scrim {
+  position: fixed;
+  inset: var(--titlebar-h) 0 0 0;
+  background: rgba(3, 5, 10, 0.55);
+  z-index: 55;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity .22s ease;
+}
+
+@media (max-width: 760px) {
+  /* Keep the input text large enough that iOS Safari won't auto-zoom on focus. */
+  input, textarea, select { font-size: 16px; }
+
+  .nav-toggle { display: inline-grid; }
+
+  /* Compact the titlebar so brand + save status + theme all fit. */
+  .titlebar-inner { gap: 8px; padding: 0 10px; }
+  .tb-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .save-status { padding: 0 8px; gap: 6px; }
+  .save-time { display: none; }
+
+  /* Sidebar becomes an off-canvas drawer. */
+  #sidebar {
+    position: fixed;
+    top: var(--titlebar-h);
+    right: 0;
+    bottom: 0;
+    width: min(84vw, 320px);
+    z-index: 60;
+    transform: translateX(105%);
+    transition: transform .24s ease;
+    box-shadow: var(--shadow);
+  }
+  body.nav-open #sidebar { transform: translateX(0); }
+  body.nav-open .nav-scrim { opacity: 1; pointer-events: auto; }
+
+  #main { padding: 0 12px; }
+
+  /* Header: title and tools stack vertically. */
+  .view-head {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+    padding: 14px 2px 10px;
+  }
+  #view-title { font-size: 20px; }
+  .view-tools { width: 100%; }
+  .search-wrap { flex: 1; min-width: 0; }
+  .search { width: 100%; }
+  .sort { flex: 1; min-width: 0; }
+
+  /* Quick-add: title on its own row, then group / due / submit. */
+  .quick-add { flex-wrap: wrap; padding: 8px; gap: 8px; }
+  .quick-add-input { flex: 1 1 100%; }
+  .quick-add .select { flex: 1; min-width: 0; }
+  .quick-add .date-input { flex: 1; min-width: 0; }
+  .quick-add .btn { flex: none; }
+
+  /* Larger touch targets. */
+  .btn { height: 40px; }
+  .icon-btn { width: 40px; height: 40px; font-size: 17px; }
+  .icon-btn.tiny { width: 32px; height: 32px; }
+  .task-actions .icon-btn { width: 40px; height: 40px; font-size: 16px; }
+  .check { width: 24px; height: 24px; margin-top: 0; }
+  .check.small { width: 20px; height: 20px; }
+  .view-item { padding: 11px 10px; }
+  .group-row { padding: 10px 8px; }
+  .link-btn { padding: 8px 4px; font-size: 12.5px; }
+  .toast-action, .toast-close { min-height: 32px; }
+
+  /* Hover-only controls must stay visible on touch. */
+  .g-menu { opacity: .9; width: 32px; height: 32px; }
+  .subtask .icon-btn { opacity: .8; width: 32px; height: 32px; }
+
+  /* Task details: controls wrap and fields share width. */
+  .detail-controls { gap: 8px; }
+  .detail-controls .field { flex: 1 1 40%; min-width: 0; }
+  .detail-controls .field .select,
+  .detail-controls .field .date-input { width: 100%; }
+
+  /* Popup menus and dialogs fit small screens and are easy to tap. */
+  .popup { max-width: calc(100vw - 16px); }
+  .popup-item { padding: 12px 10px; font-size: 14px; }
+  .popup-colors { max-width: none; gap: 9px; }
+  .swatch { width: 28px; height: 28px; }
+  .dialog { width: calc(100vw - 32px); }
+
+  .toast { bottom: 16px; max-width: calc(100vw - 24px); }
+
+  .stats { flex-wrap: wrap; gap: 8px 14px; }
+  .stats-progress { width: 90px; }
+}

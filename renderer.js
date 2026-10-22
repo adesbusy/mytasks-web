@@ -134,6 +134,14 @@ function priorityLabel(priority) {
   return (PRIORITIES[priority] || PRIORITIES.normal).label;
 }
 
+/* Mobile navigation drawer */
+function setNavOpen(open) {
+  document.body.classList.toggle('nav-open', open);
+  const toggle = $('#nav-toggle');
+  if (toggle) toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+}
+function closeNav() { setNavOpen(false); }
+
 /* ------------------------------------------------------------------ */
 /* Selection / filtering                                               */
 /* ------------------------------------------------------------------ */
@@ -152,6 +160,7 @@ function setSelection(selection) {
     state.settings.lastGroupId = selection.id;
     ui.quickGroupId = selection.id;
   }
+  closeNav();
   markDirty();
   render();
   const list = $('#task-list');
@@ -912,6 +921,19 @@ function reorderTasks(sourceId, targetId, after) {
   render();
 }
 
+/* Reordering without drag-and-drop (touch devices). */
+function moveTaskRelative(taskId, delta) {
+  const index = state.tasks.findIndex((task) => task.id === taskId);
+  if (index < 0) return;
+  const targetIndex = index + delta;
+  if (targetIndex < 0 || targetIndex >= state.tasks.length) return;
+  const [task] = state.tasks.splice(index, 1);
+  state.tasks.splice(targetIndex, 0, task);
+  if (state.settings.sort !== 'manual') state.settings.sort = 'manual';
+  markDirty();
+  render();
+}
+
 function moveTaskToGroup(taskId, groupId) {
   const task = findTask(taskId);
   const group = findGroup(groupId);
@@ -1073,6 +1095,8 @@ function openTaskMenu(task, anchor) {
     },
     { key: 'duplicate', label: 'שכפול משימה', icon: '⧉', run: () => duplicateTask(task.id) },
     { key: 'rename', label: 'עריכת כותרת', icon: '✎', run: () => { ui.expanded.add(task.id); render({ focusKey: `title-${task.id}` }); } },
+    { key: 'move-up', label: 'הזזה למעלה', icon: '↑', run: () => moveTaskRelative(task.id, -1) },
+    { key: 'move-down', label: 'הזזה למטה', icon: '↓', run: () => moveTaskRelative(task.id, 1) },
     { type: 'sep' },
     { key: 'delete', label: 'מחיקת משימה', icon: '✕', danger: true, run: () => deleteTask(task.id) },
   ]);
@@ -1448,6 +1472,7 @@ function handleKeyDown(event) {
   }
 
   if (event.key === 'Escape') {
+    if (document.body.classList.contains('nav-open')) { closeNav(); return; }
     if (ui.popup) { closePopup(); return; }
     if (ui.confirmResolve) { settleConfirm(false); return; }
     if (!$('#new-group-form').classList.contains('hidden')) { hideNewGroupForm(); return; }
@@ -1602,6 +1627,18 @@ function bindStaticEvents() {
     if (!(related instanceof Node) || !document.body.contains(related)) clearDropHints();
   });
 
+  const navToggle = $('#nav-toggle');
+  if (navToggle) {
+    navToggle.addEventListener('click', () => {
+      setNavOpen(!document.body.classList.contains('nav-open'));
+    });
+  }
+  const navScrim = $('#nav-scrim');
+  if (navScrim) navScrim.addEventListener('click', closeNav);
+  window.addEventListener('resize', () => {
+    if (window.innerWidth > 760 && document.body.classList.contains('nav-open')) closeNav();
+  });
+
   $('#theme-toggle').addEventListener('click', () => {
     state.settings.theme = state.settings.theme === 'dark' ? 'light' : 'dark';
     applyTheme();
@@ -1609,6 +1646,7 @@ function bindStaticEvents() {
   });
 
   $('#add-task-btn').addEventListener('click', () => {
+    closeNav();
     const input = $('#quick-add-input');
     if (input) { input.focus(); input.select(); }
   });
