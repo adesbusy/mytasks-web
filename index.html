@@ -50,6 +50,19 @@
       <nav id="views" class="views" aria-label="תצוגות"></nav>
 
       <div class="side-section-head">
+        <span class="side-section-title">פנקס רשומות</span>
+        <button id="add-record-btn" class="icon-btn tiny" title="רשומה חדשה" aria-label="הוספת רשומה">+</button>
+      </div>
+
+      <nav class="views" aria-label="פנקס רשומות">
+        <button id="records-nav-btn" class="view-item" data-select="records" type="button">
+          <span class="vi-icon">📒</span>
+          <span class="vi-label">כל הרשומות</span>
+          <span class="vi-count" id="records-count">0</span>
+        </button>
+      </nav>
+
+      <div class="side-section-head">
         <span class="side-section-title">קבוצות</span>
         <button id="add-group-btn" class="icon-btn tiny" title="קבוצה חדשה" aria-label="הוספת קבוצה">+</button>
       </div>
@@ -83,6 +96,8 @@
           <div id="view-sub" class="view-sub"></div>
         </div>
         <div class="view-tools">
+          <button id="bulk-toggle" class="btn tiny bulk-toggle" type="button"
+                  title="בחירה מרובה ומחיקה של מספר פריטים בבת אחת" aria-pressed="false">☑ בחירה</button>
           <div class="search-wrap">
             <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2">
               <circle cx="11" cy="11" r="7"></circle>
@@ -101,9 +116,30 @@
         <button type="submit" class="btn primary">הוספה</button>
       </form>
 
+      <form id="record-quick-add-form" class="quick-add hidden" autocomplete="off">
+        <input id="record-quick-add-input" class="quick-add-input" placeholder="רשומה חדשה — הקלד ולחץ Enter" maxlength="300" data-fk="record-quick-add">
+        <button type="submit" class="btn primary">הוספה</button>
+      </form>
+
+      <div id="bulk-bar" class="bulk-bar hidden" role="toolbar" aria-label="בחירה מרובה">
+        <label class="bulk-all-label" for="bulk-all">
+          <input type="checkbox" id="bulk-all" class="bulk-all">
+          <span>בחר הכל</span>
+        </label>
+        <span class="bulk-sep" aria-hidden="true"></span>
+        <span id="bulk-count" class="bulk-count" aria-live="polite">לא נבחרו פריטים</span>
+        <span class="spacer"></span>
+        <button id="bulk-delete" class="btn danger tiny" type="button" disabled>מחיקה</button>
+        <button id="bulk-cancel" class="btn ghost tiny" type="button" title="יציאה מבחירה מרובה (Esc)">ביטול</button>
+      </div>
+
       <div id="task-list" class="task-list"></div>
 
+      <div id="record-list" class="record-list hidden"></div>
+
       <div id="empty-state" class="empty-state hidden"></div>
+
+      <div id="record-empty" class="empty-state hidden"></div>
 
       <footer id="stats" class="stats"></footer>
     </main>

@@ -14,7 +14,7 @@
 
 (function installWebBridge() {
   const STORAGE_KEY = 'mytasks.web.v1';
-  const VERSION = '1.1.0-web';
+  const VERSION = '1.4.0-web';
 
   /* ---------------- helpers ---------------- */
 
@@ -40,6 +40,7 @@
     const gGeneral = uid();
     const gWork = uid();
     const gHome = uid();
+    const welcomeRecordId = uid();
     return {
       version: 1,
       groups: [
@@ -139,10 +140,33 @@
           subtasks: [],
         },
       ],
+      records: [
+        {
+          id: welcomeRecordId,
+          parentId: null,
+          title: 'ברוכים הבאים לפנקס הרשומות 📒',
+          body: 'כאן אפשר לשמור רשומות חופשיות — הערות, רעיונות, מספרי טלפון, מתכונים וכל דבר שאינו משימה.\n\nלחיצה על רשומה פותחת את העורך: כותרת, תוכן, הצמדה למעלה וצבע. רשומה יכולה להכיל תתי־רשומות — מהתפריט ⋯ או בכפתור “＋ תת־רשומה” שבתוך העורך, ואפשר גם לגרור רשומה על רשומה אחרת. הכל נשמר אוטומטית כמו המשימות.',
+          color: '#7c9cff',
+          pinned: false,
+          createdAt: ts,
+          updatedAt: ts,
+        },
+        {
+          id: uid(),
+          parentId: welcomeRecordId,
+          title: 'כך נראית תת־רשומה 🪆',
+          body: 'זו רשומה שמקוננת תחת הרשומה שלמעלה. אפשר לקנן גם תחתיה, עד 6 רמות. כדי לבטל את הקינון: תפריט ⋯ → “הוצאה לרמה הראשית”, או גררו אותה על רשומה אחרת.',
+          color: '#3ddc97',
+          pinned: false,
+          createdAt: ts + 1,
+          updatedAt: ts + 1,
+        },
+      ],
       settings: {
         theme: 'dark',
         selection: { kind: 'view', id: 'all' },
         sort: 'manual',
+        recordsSort: 'updated',
         lastGroupId: gGeneral,
         showCompleted: true,
       },
@@ -162,6 +186,46 @@
   const PRIORITIES = new Set(['low', 'normal', 'high']);
   const SORTS = new Set(['manual', 'due', 'priority', 'created', 'alpha']);
   const VIEWS = new Set(['all', 'today', 'week', 'done']);
+  const RECORD_SORTS = new Set(['updated', 'created', 'alpha']);
+  // How many levels of records-in-records are allowed (a root record is level 1).
+  // Keep in sync with main.js / src/renderer.js.
+  const RECORD_MAX_LEVELS = 6;
+
+  /**
+   * Repairs record nesting after loading/importing: unknown or self parents are
+   * dropped, and cycles or over-deep chains are flattened back to the top level.
+   * Records are stored as a flat list with a parentId pointer.
+   */
+  function normalizeRecordParents(records) {
+    const byId = new Map();
+    for (const record of records) {
+      // Ids must be unique: a duplicate id (e.g. from a hand-edited import) would
+      // make findRecord/delete hit both records. Keep the first, re-id the rest.
+      if (byId.has(record.id)) record.id = uid();
+      byId.set(record.id, record);
+    }
+    for (const record of records) {
+      record.parentId = record.parentId
+        && byId.has(record.parentId)
+        && record.parentId !== record.id
+        ? record.parentId
+        : null;
+      if (!record.parentId) continue;
+
+      let depth = 0;
+      let node = record;
+      const seen = new Set();
+      let valid = true;
+      while (node && node.parentId) {
+        if (seen.has(node.id) || depth >= RECORD_MAX_LEVELS) { valid = false; break; }
+        seen.add(node.id);
+        depth += 1;
+        node = byId.get(node.parentId);
+        if (!node) { valid = false; break; }
+      }
+      if (!valid || depth >= RECORD_MAX_LEVELS) record.parentId = null;
+    }
+  }
 
   function normalizeState(raw) {
     const s = raw;
@@ -206,9 +270,27 @@
           : [],
       }));
 
+    s.records = Array.isArray(s.records)
+      ? s.records
+        .filter((r) => r && typeof r === 'object' && typeof r.id === 'string' && r.id)
+        .map((r) => ({
+          id: r.id,
+          parentId: typeof r.parentId === 'string' && r.parentId ? r.parentId : null,
+          title: String(r.title ?? '').slice(0, 300),
+          body: String(r.body ?? '').slice(0, 20_000),
+          color: typeof r.color === 'string' && /^#[0-9a-f]{6}$/i.test(r.color) ? r.color : '#7c9cff',
+          pinned: !!r.pinned,
+          createdAt: Number(r.createdAt) || now(),
+          updatedAt: Number(r.updatedAt) || now(),
+        }))
+      : [];
+    normalizeRecordParents(s.records);
+
     const settings = s.settings;
     let selection = { kind: 'view', id: 'all' };
-    if (settings.selection && settings.selection.kind === 'group' && groupIds.has(settings.selection.id)) {
+    if (settings.selection && settings.selection.kind === 'records') {
+      selection = { kind: 'records' };
+    } else if (settings.selection && settings.selection.kind === 'group' && groupIds.has(settings.selection.id)) {
       selection = { kind: 'group', id: settings.selection.id };
     } else if (settings.selection && settings.selection.kind === 'view' && VIEWS.has(settings.selection.id)) {
       selection = { kind: 'view', id: settings.selection.id };
@@ -217,6 +299,7 @@
       theme: settings.theme === 'light' ? 'light' : 'dark',
       selection,
       sort: SORTS.has(settings.sort) ? settings.sort : 'manual',
+      recordsSort: RECORD_SORTS.has(settings.recordsSort) ? settings.recordsSort : 'updated',
       lastGroupId: groupIds.has(settings.lastGroupId) ? settings.lastGroupId : fallbackGroup,
       showCompleted: settings.showCompleted !== false,
     };
@@ -275,7 +358,8 @@
   function saveSync(state) {
     if (!isStateShape(state)) return { ok: false, error: 'invalid-state' };
     try {
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+      const normalized = normalizeState(JSON.parse(JSON.stringify(state)));
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(normalized));
       return { ok: true, savedAt: Date.now() };
     } catch (err) {
       return { ok: false, error: String((err && err.message) || err) };

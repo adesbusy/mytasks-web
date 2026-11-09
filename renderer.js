@@ -37,6 +37,16 @@ const PRIORITIES = {
 const PRIORITY_ORDER = { high: 0, normal: 1, low: 2 };
 
 const GROUP_COLORS = ['#7c9cff', '#3ddc97', '#ffb454', '#ff6b6b', '#c792ea', '#4dd0e1', '#f78fb3', '#a3e635'];
+const RECORD_COLORS = GROUP_COLORS;
+
+const RECORD_SORT_OPTIONS = [
+  { id: 'updated', label: 'סידור: עודכן לאחרונה' },
+  { id: 'created', label: 'סידור: חדש ביותר' },
+  { id: 'alpha', label: 'סידור: אלף־בית' },
+];
+
+// How many levels of records-in-records are allowed (a root record is level 1).
+const RECORD_MAX_LEVELS = 6;
 
 const SAVE_DEBOUNCE_MS = 200;
 const STATUS_HEARTBEAT_MS = 30_000;
@@ -50,6 +60,11 @@ let info = null;
 
 const ui = {
   expanded: new Set(),
+  expandedRecords: new Set(),
+  // Records default to showing their sub-records; this set holds the ones the
+  // user collapsed, so the state is only remembered for the current run.
+  collapsedRecordChildren: new Set(),
+  bulk: { active: false, kind: null, ids: new Set() },
   search: '',
   quickGroupId: null,
   dirty: false,
@@ -62,6 +77,7 @@ const ui = {
 };
 
 let dragTaskId = null;
+let dragRecordId = null;
 
 /* ------------------------------------------------------------------ */
 /* Small helpers                                                       */
@@ -116,6 +132,9 @@ function findTask(taskId) {
 function findGroup(groupId) {
   return state.groups.find((group) => group.id === groupId) || null;
 }
+function findRecord(recordId) {
+  return state.records.find((record) => record.id === recordId) || null;
+}
 
 function describeDue(due, isDone) {
   if (!due) return null;
@@ -149,12 +168,16 @@ function closeNav() { setNavOpen(false); }
 function activeSelection() {
   const settings = state.settings;
   const selection = settings && settings.selection;
+  if (selection && selection.kind === 'records') return selection;
   if (selection && selection.kind === 'group' && findGroup(selection.id)) return selection;
   if (selection && selection.kind === 'view' && VIEW_DEFS.some((view) => view.id === selection.id)) return selection;
   return { kind: 'view', id: 'all' };
 }
 
 function setSelection(selection) {
+  // Selection mode is scoped to the list it was opened in: switching views,
+  // groups or the records notebook always leaves it cleanly.
+  if (ui.bulk.active) resetBulk();
   state.settings.selection = selection;
   if (selection.kind === 'group') {
     state.settings.lastGroupId = selection.id;
@@ -163,8 +186,167 @@ function setSelection(selection) {
   closeNav();
   markDirty();
   render();
-  const list = $('#task-list');
+  const list = selection.kind === 'records' ? $('#record-list') : $('#task-list');
   if (list) list.scrollTop = 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Bulk selection + bulk delete                                        */
+/* ------------------------------------------------------------------ */
+
+// Tasks and records keep completely separate selection modes: the mode is
+// bound to one kind at a time and every mutation checks the kind again, so a
+// task selection can never delete a record (or the other way around).
+const bulkKindFor = (selection = activeSelection()) => (selection.kind === 'records' ? 'records' : 'tasks');
+
+function bulkNoun(kind, count) {
+  if (kind === 'records') return count === 1 ? 'רשומה' : 'רשומות';
+  return count === 1 ? 'משימה' : 'משימות';
+}
+
+function bulkVisibleItems(kind) {
+  if (kind === 'records') {
+    const list = visibleRecords();
+    const query = ui.search.trim().toLowerCase();
+    // While filtering, only real matches are bulk-selectable: the ancestor rows
+    // are context, and selecting them would delete records the user never saw.
+    if (query) return list.filter((record) => matchesRecordSearch(record, query));
+    return list;
+  }
+  return visibleTasks();
+}
+
+function resetBulk() {
+  ui.bulk.active = false;
+  ui.bulk.kind = null;
+  ui.bulk.ids.clear();
+}
+
+function enterBulkMode() {
+  ui.bulk.active = true;
+  ui.bulk.kind = bulkKindFor();
+  ui.bulk.ids.clear();
+  closePopup();
+  render();
+}
+
+function exitBulkMode() {
+  if (!ui.bulk.active) return;
+  resetBulk();
+  render();
+}
+
+function toggleBulkMode() {
+  if (ui.bulk.active) exitBulkMode();
+  else enterBulkMode();
+}
+
+function toggleBulkItem(kind, id) {
+  if (!ui.bulk.active || ui.bulk.kind !== kind || !id) return;
+  if (kind === 'records') {
+    // Ancestor/descendant rows kept visible by a filter are view-only.
+    const query = ui.search.trim().toLowerCase();
+    const record = findRecord(id);
+    if (query && record && !matchesRecordSearch(record, query)) return;
+  }
+  if (ui.bulk.ids.has(id)) ui.bulk.ids.delete(id);
+  else ui.bulk.ids.add(id);
+  render();
+}
+
+function toggleBulkAll() {
+  if (!ui.bulk.active) return;
+  const kind = ui.bulk.kind;
+  const items = bulkVisibleItems(kind);
+  const allSelected = items.length > 0 && items.every((item) => ui.bulk.ids.has(item.id));
+  if (allSelected) items.forEach((item) => ui.bulk.ids.delete(item.id));
+  else items.forEach((item) => ui.bulk.ids.add(item.id));
+  render();
+}
+
+async function bulkDeleteSelected() {
+  if (!ui.bulk.active) return;
+  const kind = ui.bulk.kind;
+  const ids = new Set(ui.bulk.ids);
+  if (!ids.size) return;
+
+  // Deleting a record always takes its sub-records with it, so expand the
+  // selection to the whole subtree (selected children are deduplicated).
+  const deleteIds = new Set(ids);
+  if (kind === 'records') {
+    for (const id of ids) {
+      for (const subtreeId of recordSubtreeIds(id)) deleteIds.add(subtreeId);
+    }
+  }
+
+  const source = kind === 'records' ? state.records : state.tasks;
+  const picked = [];
+  source.forEach((item, index) => {
+    if (deleteIds.has(item.id)) picked.push({ index, item });
+  });
+  if (!picked.length) return;
+
+  const selectedCount = ids.size;
+  const nestedCount = kind === 'records' ? picked.length - selectedCount : 0;
+  const noun = bulkNoun(kind, selectedCount);
+  const subtaskCount = kind === 'tasks'
+    ? picked.reduce((sum, entry) => sum + (entry.item.subtasks ? entry.item.subtasks.length : 0), 0)
+    : 0;
+  let extra = '';
+  if (kind === 'tasks' && subtaskCount) {
+    extra = ` יימחקו גם ${subtaskCount} תתי־משימות.`;
+  } else if (kind === 'records' && nestedCount) {
+    extra = ` יימחקו גם ${nestedCount} תתי־רשומות.`;
+  }
+  const confirmed = await askConfirm({
+    title: kind === 'records' ? 'מחיקת רשומות' : 'מחיקת משימות',
+    body: `למחוק ${selectedCount} ${noun}?${extra} אפשר לבטל מיד אחרי המחיקה.`,
+    confirmText: 'מחיקה',
+  });
+  if (!confirmed) return;
+
+  const snapshot = picked.map((entry) => ({
+    index: entry.index,
+    item: JSON.parse(JSON.stringify(entry.item)),
+  }));
+  const expandedSnapshot = kind === 'records'
+    ? [...deleteIds].filter((id) => ui.expandedRecords.has(id))
+    : [];
+  const collapsedSnapshot = kind === 'records'
+    ? [...deleteIds].filter((id) => ui.collapsedRecordChildren.has(id))
+    : [];
+
+  if (kind === 'records') {
+    state.records = state.records.filter((item) => !deleteIds.has(item.id));
+    snapshot.forEach(({ item }) => {
+      ui.expandedRecords.delete(item.id);
+      ui.collapsedRecordChildren.delete(item.id);
+    });
+  } else {
+    state.tasks = state.tasks.filter((item) => !deleteIds.has(item.id));
+    snapshot.forEach(({ item }) => ui.expanded.delete(item.id));
+  }
+
+  resetBulk();
+  markDirty();
+  render();
+  toast(`${selectedCount} ${noun} ${selectedCount === 1 ? 'נמחקה' : 'נמחקו'}${nestedCount ? ` עם ${nestedCount} תתי־רשומות` : ''}`, {
+    actionLabel: 'ביטול',
+    duration: 8000,
+    onAction: () => {
+      const list = kind === 'records' ? state.records : state.tasks;
+      snapshot
+        .sort((a, b) => a.index - b.index)
+        .forEach(({ index, item }) => list.splice(Math.min(index, list.length), 0, item));
+      if (kind === 'records') {
+        expandedSnapshot.forEach((id) => ui.expandedRecords.add(id));
+        collapsedSnapshot.forEach((id) => ui.collapsedRecordChildren.add(id));
+      }
+      markDirty();
+      render();
+      toast(`${selectedCount} ${noun} ${selectedCount === 1 ? 'שוחזרה' : 'שוחזרו'}`);
+    },
+  });
 }
 
 function tasksForSelection(selection = activeSelection()) {
@@ -261,6 +443,165 @@ function viewBadges() {
   return { badges, overdue };
 }
 
+function matchesRecordSearch(record, query) {
+  if (!query) return true;
+  return `${record.title} ${record.body}`.toLowerCase().includes(query);
+}
+
+function recordSortComparator(sort) {
+  switch (sort) {
+    case 'created':
+      return (a, b) => b.createdAt - a.createdAt;
+    case 'alpha':
+      return (a, b) => a.title.localeCompare(b.title, 'he');
+    case 'updated':
+    default:
+      return (a, b) => b.updatedAt - a.updatedAt;
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Records tree (רשומה שמכילה תתי־רשומות)                              */
+/* ------------------------------------------------------------------ */
+
+const recordParentId = (record) => (record && record.parentId) || null;
+
+/** Number of ancestors a record has (0 = top-level record). */
+function recordDepth(record) {
+  let depth = 0;
+  let node = record;
+  const seen = new Set();
+  while (node) {
+    const parentId = recordParentId(node);
+    if (!parentId || seen.has(node.id) || depth > 100) break;
+    seen.add(node.id);
+    node = findRecord(parentId);
+    depth += 1;
+  }
+  return depth;
+}
+
+/** Children of every record, grouped by parent id ('' = top-level records). */
+function recordChildrenMap() {
+  const ids = new Set(state.records.map((record) => record.id));
+  const map = new Map();
+  for (const record of state.records) {
+    const parentId = recordParentId(record);
+    const key = parentId && parentId !== record.id && ids.has(parentId) ? parentId : '';
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push(record);
+  }
+  return map;
+}
+
+/** Children grouped by parent, with pinned records first and the chosen sort. */
+function sortedRecordChildren() {
+  const children = recordChildrenMap();
+  const compare = recordSortComparator(state.settings.recordsSort || 'updated');
+  const pinnedFirst = (a, b) => Number(!!b.pinned) - Number(!!a.pinned) || compare(a, b);
+  for (const list of children.values()) list.sort(pinnedFirst);
+  return children;
+}
+
+/** Number of records nested at any depth under every record (subtree size). */
+function recordSubtreeSizes(children) {
+  const sizes = new Map();
+  const visit = (record) => {
+    if (sizes.has(record.id)) return sizes.get(record.id);
+    let total = 0;
+    for (const child of children.get(record.id) || []) total += 1 + visit(child);
+    sizes.set(record.id, total);
+    return total;
+  };
+  for (const root of children.get('') || []) visit(root);
+  return sizes;
+}
+
+/** Ids of a record and everything nested under it, parents before children. */
+function recordSubtreeIds(recordId) {
+  const record = findRecord(recordId);
+  if (!record) return [];
+  const children = recordChildrenMap();
+  const ids = [];
+  const seen = new Set();
+  const stack = [record];
+  while (stack.length) {
+    const node = stack.pop();
+    if (seen.has(node.id)) continue;
+    seen.add(node.id);
+    ids.push(node.id);
+    const kids = children.get(node.id) || [];
+    for (let index = kids.length - 1; index >= 0; index -= 1) stack.push(kids[index]);
+  }
+  return ids;
+}
+
+/** Number of sub-records in a record's subtree. */
+function recordNestedCount(recordId) {
+  return Math.max(0, recordSubtreeIds(recordId).length - 1);
+}
+
+/** Sub-records are expanded unless the user collapsed them (search expands all). */
+function recordChildrenVisible(record, forceOpen = false) {
+  if (forceOpen) return true;
+  return !ui.collapsedRecordChildren.has(record.id);
+}
+
+/**
+ * While searching, keep a record when it matches, when it holds a matching
+ * sub-record (ancestor path), or when it is nested under a match.
+ */
+function recordSearchKeep() {
+  const query = ui.search.trim().toLowerCase();
+  if (!query) return null;
+  const children = recordChildrenMap();
+  const keep = new Set();
+  const expanded = new Set();
+  for (const record of state.records) {
+    if (!matchesRecordSearch(record, query)) continue;
+    let node = record;
+    let guard = 0;
+    while (node && guard < 200) {
+      keep.add(node.id);
+      const parentId = recordParentId(node);
+      node = parentId ? findRecord(parentId) : null;
+      guard += 1;
+    }
+    const stack = [record.id];
+    while (stack.length) {
+      const id = stack.pop();
+      keep.add(id);
+      if (expanded.has(id)) continue;
+      expanded.add(id);
+      for (const child of children.get(id) || []) stack.push(child.id);
+    }
+  }
+  return keep;
+}
+
+/** Number of records that actually match the current search query. */
+function recordSearchMatchCount() {
+  const query = ui.search.trim().toLowerCase();
+  if (!query) return state.records.length;
+  return state.records.filter((record) => matchesRecordSearch(record, query)).length;
+}
+
+/** Flat list of the records currently shown, in tree order (parents first). */
+function visibleRecords() {
+  const children = sortedRecordChildren();
+  const keep = recordSearchKeep();
+  const out = [];
+  const walk = (parentKey) => {
+    for (const record of children.get(parentKey) || []) {
+      if (keep && !keep.has(record.id)) continue;
+      out.push(record);
+      if (recordChildrenVisible(record, !!keep)) walk(record.id);
+    }
+  };
+  walk('');
+  return out;
+}
+
 /* ------------------------------------------------------------------ */
 /* Save pipeline                                                       */
 /* ------------------------------------------------------------------ */
@@ -296,7 +637,11 @@ function markDirty() {
 }
 
 function flushSave() {
-  if (!state || !ui.dirty) return Promise.resolve({ ok: true, skipped: true });
+  if (!state) return Promise.resolve({ ok: true, skipped: true });
+  // Even when nothing new is dirty, resolve only after any in-flight save has
+  // actually hit the disk — callers (smoke test, Ctrl+S, close handlers) rely
+  // on the file being current when this promise resolves.
+  if (!ui.dirty) return ui.saveChain.then(() => ({ ok: true, skipped: true }));
   clearTimeout(ui.saveTimer);
   ui.saveTimer = null;
   ui.dirty = false;
@@ -362,17 +707,34 @@ function render(options = {}) {
   if (!state) return;
   closePopup();
   const focus = options.focusKey ? { key: options.focusKey, start: null, end: null } : captureFocus();
-  const scrollTop = $('#task-list') ? $('#task-list').scrollTop : 0;
   const selection = activeSelection();
+  const isRecords = selection.kind === 'records';
+
+  // Tasks and records are two mutually exclusive modes — hide the other mode's
+  // list and empty state so they never render simultaneously.
+  const taskList = $('#task-list');
+  const taskEmpty = $('#empty-state');
+  const recordList = $('#record-list');
+  const recordEmpty = $('#record-empty');
+  if (taskList) taskList.classList.toggle('hidden', isRecords);
+  if (taskEmpty) taskEmpty.classList.toggle('hidden', isRecords);
+  if (recordList) recordList.classList.toggle('hidden', !isRecords);
+  if (recordEmpty) recordEmpty.classList.toggle('hidden', !isRecords);
+
+  const scrollTop = isRecords
+    ? ($('#record-list') ? $('#record-list').scrollTop : 0)
+    : ($('#task-list') ? $('#task-list').scrollTop : 0);
 
   renderSidebar(selection);
   renderHeader(selection);
   renderQuickAdd(selection);
-  renderSort();
-  renderTaskList(selection);
+  renderSort(selection);
+  if (isRecords) renderRecordList(selection);
+  else renderTaskList(selection);
   renderStats(selection);
+  renderBulkUi(selection);
 
-  const list = $('#task-list');
+  const list = isRecords ? $('#record-list') : $('#task-list');
   if (list) list.scrollTop = scrollTop;
   restoreFocus(focus);
 }
@@ -406,6 +768,13 @@ function renderSidebar(selection) {
       </li>`;
   }).join('');
 
+  const recordsBtn = $('#records-nav-btn');
+  if (recordsBtn) {
+    recordsBtn.classList.toggle('active', selection.kind === 'records');
+    const countEl = $('#records-count');
+    if (countEl) countEl.textContent = state.records.length;
+  }
+
   const pathEl = $('#save-path');
   if (pathEl && info && info.dataPath) {
     pathEl.textContent = info.dataPath;
@@ -416,7 +785,12 @@ function renderSidebar(selection) {
 function renderHeader(selection) {
   const titleEl = $('#view-title');
   const subEl = $('#view-sub');
-  if (selection.kind === 'group') {
+  const searchEl = $('#search');
+  if (searchEl) searchEl.placeholder = selection.kind === 'records' ? 'חיפוש רשומות…' : 'חיפוש משימות…';
+
+  if (selection.kind === 'records') {
+    titleEl.textContent = 'פנקס רשומות';
+  } else if (selection.kind === 'group') {
     const group = findGroup(selection.id);
     titleEl.innerHTML = group
       ? `<span class="title-dot" style="--c:${esc(group.color)}"></span>${esc(group.name)}`
@@ -426,22 +800,43 @@ function renderHeader(selection) {
     titleEl.textContent = view.label;
   }
 
-  const counts = scopeCounts(selection);
   const parts = [];
   const query = ui.search.trim();
-  if (query) {
-    const found = visibleTasks().length;
-    parts.push(`נמצאו ${found} תוצאות עבור “${esc(query)}”`);
+  if (selection.kind === 'records') {
+    const total = state.records.length;
+    const nested = state.records.filter((record) => !!recordParentId(record)).length;
+    if (query) {
+      const matches = recordSearchMatchCount();
+      parts.push(matches === 1
+        ? `נמצאה רשומה אחת עבור “${esc(query)}”`
+        : `נמצאו ${matches} רשומות עבור “${esc(query)}”`);
+    } else {
+      parts.push(`${total} רשומות`);
+      if (nested) parts.push(recordChildCountLabel(nested));
+      const pinnedCount = state.records.filter((r) => r.pinned).length;
+      if (pinnedCount) parts.push(`${pinnedCount} מוצמדות`);
+    }
   } else {
-    parts.push(`${counts.open} פתוחות`);
-    if (counts.done) parts.push(`${counts.done} הושלמו`);
-    if (selection.kind === 'view' && selection.id === 'today' && counts.total === 0) parts.push('אין משימות שמחכות להיום');
+    const counts = scopeCounts(selection);
+    if (query) {
+      const found = visibleTasks().length;
+      parts.push(`נמצאו ${found} תוצאות עבור “${esc(query)}”`);
+    } else {
+      parts.push(`${counts.open} פתוחות`);
+      if (counts.done) parts.push(`${counts.done} הושלמו`);
+      if (selection.kind === 'view' && selection.id === 'today' && counts.total === 0) parts.push('אין משימות שמחכות להיום');
+    }
+    if (counts.overdue > 0) parts.push(`<span class="overdue-note">${counts.overdue} באיחור</span>`);
   }
-  if (counts.overdue > 0) parts.push(`<span class="overdue-note">${counts.overdue} באיחור</span>`);
   subEl.innerHTML = parts.join(' · ');
 }
 
 function renderQuickAdd(selection) {
+  const taskForm = $('#quick-add-form');
+  const recordForm = $('#record-quick-add-form');
+  if (taskForm) taskForm.classList.toggle('hidden', selection.kind === 'records');
+  if (recordForm) recordForm.classList.toggle('hidden', selection.kind !== 'records');
+
   const groupSelect = $('#quick-add-group');
   if (!groupSelect) return;
   let selected = ui.quickGroupId;
@@ -456,13 +851,14 @@ function renderQuickAdd(selection) {
   if (selected) groupSelect.value = selected;
 }
 
-function renderSort() {
+function renderSort(selection) {
   const sortSelect = $('#sort');
   if (!sortSelect) return;
-  sortSelect.innerHTML = SORT_OPTIONS.map((option) => (
+  const options = selection.kind === 'records' ? RECORD_SORT_OPTIONS : SORT_OPTIONS;
+  sortSelect.innerHTML = options.map((option) => (
     `<option value="${option.id}">${option.label}</option>`
   )).join('');
-  sortSelect.value = state.settings.sort;
+  sortSelect.value = selection.kind === 'records' ? (state.settings.recordsSort || 'updated') : state.settings.sort;
 }
 
 function renderTaskList(selection) {
@@ -481,6 +877,162 @@ function renderTaskList(selection) {
   container.classList.remove('hidden');
   empty.classList.add('hidden');
   container.innerHTML = list.map((task) => taskHtml(task, selection)).join('');
+}
+
+function renderRecordList(selection) {
+  const container = $('#record-list');
+  const empty = $('#record-empty');
+  const children = sortedRecordChildren();
+  const sizes = recordSubtreeSizes(children);
+  const query = ui.search.trim().toLowerCase();
+  const keep = recordSearchKeep();
+  const filtering = !!keep;
+  const html = [];
+
+  const walk = (parentKey, depth) => {
+    for (const record of children.get(parentKey) || []) {
+      if (keep && !keep.has(record.id)) continue;
+      const kids = children.get(record.id) || [];
+      html.push(recordHtml(record, depth, kids, {
+        forceOpen: filtering,
+        searching: filtering,
+        // While filtering, ancestor/descendant context rows are view-only.
+        selectable: !filtering || matchesRecordSearch(record, query),
+        nestedCount: sizes.get(record.id) || 0,
+      }));
+      if (kids.length && recordChildrenVisible(record, filtering)) walk(record.id, depth + 1);
+    }
+  };
+  walk('', 0);
+
+  if (html.length === 0) {
+    container.innerHTML = '';
+    container.classList.add('hidden');
+    empty.classList.remove('hidden');
+    empty.innerHTML = recordEmptyHtml();
+    return;
+  }
+
+  container.classList.remove('hidden');
+  empty.classList.add('hidden');
+  container.innerHTML = html.join('');
+}
+
+function recordEmptyHtml() {
+  const query = ui.search.trim();
+  if (query) {
+    return `
+      <div class="empty-icon">⌕</div>
+      <div class="empty-title">לא נמצאו רשומות</div>
+      <div class="empty-sub">אין תוצאות עבור “${esc(query)}”. נסה מילה אחרת או נקה את החיפוש.</div>`;
+  }
+  return `
+    <div class="empty-icon">📒</div>
+    <div class="empty-title">הפנקס ריק</div>
+    <div class="empty-sub">הוסף רשומה בתיבה שלמעלה — אפשר לקנן בה תתי־רשומות, לכתוב הערות, רעיונות, מספרי טלפון וכל דבר שתרצה לשמור.</div>`;
+}
+
+function recordChildCountLabel(count) {
+  if (count === 1) return 'תת־רשומה אחת';
+  return `${count} תתי־רשומות`;
+}
+
+function recordHtml(record, depth, children, options = {}) {
+  const bulk = ui.bulk.active && ui.bulk.kind === 'records';
+  const selectable = options.selectable !== false;
+  const selected = bulk && selectable && ui.bulk.ids.has(record.id);
+  const isOpen = !bulk && ui.expandedRecords.has(record.id);
+  const snippet = record.body.trim();
+  const hasChildren = children.length > 0;
+  const nestedCount = Math.max(0, options.nestedCount || 0);
+  const searching = !!options.searching;
+  const isCollapsed = hasChildren && !searching && !recordChildrenVisible(record);
+  const title = record.title || 'רשומה ללא כותרת';
+  const classes = [
+    'record',
+    depth > 0 ? 'child' : '',
+    isOpen ? 'open' : '',
+    bulk ? 'bulk' : '',
+    selected ? 'selected' : '',
+    hasChildren ? 'has-children' : '',
+    isCollapsed ? 'children-collapsed' : '',
+    searching ? 'filtering' : '',
+  ].filter(Boolean).join(' ');
+  const twistyTitle = searching
+    ? 'בזמן חיפוש כל הענפים פתוחים'
+    : isCollapsed ? 'הצגת תתי־הרשומות' : 'הסתרת תתי־הרשומות';
+
+  return `
+    <article class="${classes}" data-record-id="${esc(record.id)}" style="--depth:${depth}"
+             draggable="${!bulk && !isOpen ? 'true' : 'false'}">
+      <div class="record-row" data-act="${bulk ? 'bulk-item' : 'record-expand'}">
+        ${bulk ? (selectable ? selectBoxHtml(selected) : '<span class="select-spacer" aria-hidden="true"></span>') : ''}
+        ${hasChildren
+          ? `<button class="twisty${isCollapsed ? ' collapsed' : ''}" data-act="record-children" type="button"
+                     ${searching ? 'disabled' : ''}
+                     title="${twistyTitle}"
+                     aria-label="${twistyTitle}"
+                     aria-expanded="${isCollapsed ? 'false' : 'true'}">▾</button>`
+          : '<span class="twisty-spacer" aria-hidden="true"></span>'}
+        <span class="r-dot" style="--c:${esc(record.color)}"></span>
+        <div class="record-body">
+          <div class="record-title-line">
+            <span class="record-title"${bulk ? '' : ' data-act="record-edit-title"'} title="${bulk ? 'לחיצה לסימון לבחירה' : 'לחיצה לפתיחת העורך'}">${esc(title)}</span>
+            ${record.pinned ? '<span class="record-pin" title="מוצמדת ברמה שלה">📌</span>' : ''}
+            ${hasChildren
+              ? `<button class="record-kids-chip" data-act="record-children" type="button" ${searching ? 'disabled' : ''}
+                         title="${esc(recordChildCountLabel(nestedCount))} מקוננות בכל הרמות">${esc(recordChildCountLabel(nestedCount))}</button>`
+              : ''}
+          </div>
+          ${snippet ? `<div class="record-snippet">${esc(snippet)}</div>` : ''}
+        </div>
+        ${bulk ? '' : `<div class="record-actions">
+          <span class="record-date">${formatTimestamp(record.updatedAt)}</span>
+          <button class="icon-btn chevron" data-act="record-expand" type="button"
+                  title="${isOpen ? 'סגירת העורך' : 'פתיחת העורך'}" aria-label="${isOpen ? 'סגירת העורך' : 'פתיחת העורך'}">▾</button>
+          <button class="icon-btn" data-act="record-menu" type="button"
+                  title="פעולות נוספות" aria-label="פעולות נוספות">⋯</button>
+        </div>`}
+      </div>
+      ${isOpen ? recordDetailsHtml(record, depth, children, nestedCount) : ''}
+    </article>`;
+}
+
+function recordDetailsHtml(record, depth, children, nestedCount = 0) {
+  const canNest = depth + 1 < RECORD_MAX_LEVELS;
+  const kidsSummary = children.length
+    ? `<div class="record-kids-summary">${nestedCount === 1
+      ? 'רשומה אחת מקוננת תחת הרשומה הזו — היא מופיעה מתחתיה ברשימה.'
+      : `${esc(recordChildCountLabel(nestedCount))} מקוננות תחת הרשומה הזו (כולל תתי־רמות) — הן מופיעות מתחתיה ברשימה.`}</div>`
+    : '';
+  const pinLabel = recordParentId(record)
+    ? (record.pinned ? '📌 מוצמדת בין תתי־הרשומות' : '📌 הצמדה בין תתי־הרשומות')
+    : (record.pinned ? '📌 מוצמדת' : '📌 הצמדה למעלה');
+  return `
+    <div class="record-details">
+      <input class="title-input" data-role="record-title" data-fk="rtitle-${esc(record.id)}"
+             value="${esc(record.title)}" placeholder="כותרת הרשומה" maxlength="300" aria-label="כותרת הרשומה">
+
+      <div>
+        <div class="detail-label">תוכן</div>
+        <textarea class="notes record-body-input" data-role="record-body" data-fk="rbody-${esc(record.id)}"
+                  placeholder="תוכן הרשומה…" maxlength="20000">${esc(record.body)}</textarea>
+      </div>
+
+      ${kidsSummary}
+
+      <div class="detail-controls">
+        <button class="btn tiny" data-act="record-pin" type="button">${pinLabel}</button>
+        <button class="btn tiny" data-act="record-color" type="button">צבע</button>
+        ${canNest ? '<button class="btn tiny" data-act="record-add-child" type="button" title="הוספת רשומה מקוננת תחת הרשומה הזו">＋ תת־רשומה</button>' : ''}
+        <button class="btn danger-ghost" data-act="delete-record" type="button">מחיקת רשומה</button>
+      </div>
+
+      <div class="detail-meta">
+        <span>נוצר ${formatTimestamp(record.createdAt)} · עודכן ${formatTimestamp(record.updatedAt)}${nestedCount ? ` · ${esc(recordChildCountLabel(nestedCount))}` : ''}</span>
+        <span>שמירה אוטומטית</span>
+      </div>
+    </div>`;
 }
 
 function emptyStateHtml(selection) {
@@ -522,8 +1074,10 @@ function emptyStateHtml(selection) {
 }
 
 function taskHtml(task, selection) {
+  const bulk = ui.bulk.active && ui.bulk.kind === 'tasks';
+  const selected = bulk && ui.bulk.ids.has(task.id);
   const isDone = !!task.done;
-  const isOpen = ui.expanded.has(task.id);
+  const isOpen = !bulk && ui.expanded.has(task.id);
   const group = findGroup(task.groupId);
   const subtasks = task.subtasks || [];
   const subtasksDone = subtasks.filter((subtask) => subtask.done).length;
@@ -549,24 +1103,24 @@ function taskHtml(task, selection) {
     : '';
 
   return `
-    <article class="task${isDone ? ' is-done' : ''}${isOpen ? ' open' : ''}"
-             data-task-id="${esc(task.id)}" draggable="${isOpen ? 'false' : 'true'}">
-      <div class="task-row" data-act="toggle-expand">
-        <button class="check${isDone ? ' on' : ''}" data-act="toggle-task" type="button"
-                title="${isDone ? 'סימון כלא בוצע' : 'סימון כבוצע'}" aria-label="${isDone ? 'סימון כלא בוצע' : 'סימון כבוצע'}"></button>
+    <article class="task${isDone ? ' is-done' : ''}${isOpen ? ' open' : ''}${bulk ? ' bulk' : ''}${selected ? ' selected' : ''}"
+             data-task-id="${esc(task.id)}" draggable="${!bulk && !isOpen ? 'true' : 'false'}">
+      <div class="task-row" data-act="${bulk ? 'bulk-item' : 'toggle-expand'}">
+        ${bulk ? selectBoxHtml(selected) : `<button class="check${isDone ? ' on' : ''}" data-act="toggle-task" type="button"
+                title="${isDone ? 'סימון כלא בוצע' : 'סימון כבוצע'}" aria-label="${isDone ? 'סימון כלא בוצע' : 'סימון כבוצע'}"></button>`}
         <div class="task-body">
           <div class="task-title-line">
-            <span class="task-title" data-act="edit-title" title="לחיצה לפתיחת הפרטים">${esc(task.title)}</span>
+            <span class="task-title"${bulk ? '' : ' data-act="edit-title"'} title="${bulk ? 'לחיצה לסימון לבחירה' : 'לחיצה לפתיחת הפרטים'}">${esc(task.title)}</span>
             ${chips.join('')}
           </div>
           ${meta}
         </div>
-        <div class="task-actions">
+        ${bulk ? '' : `<div class="task-actions">
           <button class="icon-btn chevron" data-act="toggle-expand" type="button"
                   title="${isOpen ? 'סגירת פרטים' : 'פתיחת פרטים'}" aria-label="${isOpen ? 'סגירת פרטים' : 'פתיחת פרטים'}">▾</button>
           <button class="icon-btn" data-act="task-menu" type="button"
                   title="פעולות נוספות" aria-label="פעולות נוספות">⋯</button>
-        </div>
+        </div>`}
       </div>
       ${isOpen ? taskDetailsHtml(task) : ''}
     </article>`;
@@ -638,6 +1192,22 @@ function taskDetailsHtml(task) {
 }
 
 function renderStats(selection) {
+  if (selection.kind === 'records') {
+    const total = state.records.length;
+    const visibleCount = visibleRecords().length;
+    const pinned = state.records.filter((r) => r.pinned).length;
+    const roots = total - state.records.filter((record) => !!recordParentId(record)).length;
+    const parts = [];
+    parts.push(`<span class="stat"><b>${visibleCount}</b> רשומות בתצוגה</span>`);
+    parts.push(`<span class="stat"><b>${total}</b> סך הכול</span>`);
+    if (roots !== total) parts.push(`<span class="stat"><b>${roots}</b> ברמה ראשית</span>`);
+    if (pinned) parts.push(`<span class="stat"><b>${pinned}</b> מוצמדות</span>`);
+    parts.push('<span class="spacer"></span>');
+    parts.push('<span class="stat">שמירה אוטומטית</span>');
+    $('#stats').innerHTML = parts.join('');
+    return;
+  }
+
   const visible = visibleTasks();
   const doneVisible = visible.filter((task) => task.done).length;
   const openVisible = visible.length - doneVisible;
@@ -655,6 +1225,63 @@ function renderStats(selection) {
   parts.push(`<span class="stats-progress"><span style="width:${pct}%"></span></span>`);
   parts.push(`<span class="stat stats-pct">${pct}%</span>`);
   $('#stats').innerHTML = parts.join('');
+}
+
+/* ------------------------------------------------------------------ */
+/* Bulk selection UI                                                   */
+/* ------------------------------------------------------------------ */
+
+function selectBoxHtml(selected) {
+  const label = selected ? 'הסרת הסימון' : 'סימון לבחירה';
+  return `<button class="select-box${selected ? ' on' : ''}" data-act="bulk-item" type="button"
+                  title="${label}" aria-label="${label}" aria-pressed="${selected}"></button>`;
+}
+
+function renderBulkUi(selection) {
+  const toggle = $('#bulk-toggle');
+  const bar = $('#bulk-bar');
+  const kind = bulkKindFor(selection);
+
+  // Safety net: a selection never survives a switch to the other list kind.
+  if (ui.bulk.active && ui.bulk.kind !== kind) resetBulk();
+  const active = ui.bulk.active;
+
+  if (toggle) {
+    toggle.classList.toggle('on', active);
+    toggle.setAttribute('aria-pressed', String(active));
+    toggle.textContent = active ? 'ביטול בחירה' : '☑ בחירה';
+    toggle.title = active
+      ? 'יציאה מבחירה מרובה (Esc)'
+      : 'בחירה מרובה ומחיקה של מספר פריטים בבת אחת';
+  }
+  if (bar) bar.classList.toggle('hidden', !active);
+  if (!active) return;
+
+  const items = bulkVisibleItems(kind);
+  const selectedVisible = items.filter((item) => ui.bulk.ids.has(item.id)).length;
+  const count = ui.bulk.ids.size;
+  const noun = bulkNoun(kind, count);
+
+  const all = $('#bulk-all');
+  if (all) {
+    all.checked = items.length > 0 && selectedVisible === items.length;
+    all.indeterminate = selectedVisible > 0 && selectedVisible < items.length;
+    all.disabled = items.length === 0;
+  }
+
+  const countEl = $('#bulk-count');
+  if (countEl) {
+    countEl.textContent = count
+      ? `${count} ${noun} ${count === 1 ? 'נבחרה' : 'נבחרו'}`
+      : `לא נבחרו ${bulkNoun(kind, 2)}`;
+  }
+  if (bar) bar.classList.toggle('has-selection', count > 0);
+
+  const del = $('#bulk-delete');
+  if (del) {
+    del.disabled = count === 0;
+    del.textContent = count ? `מחיקת ${count} ${noun}` : 'מחיקה';
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -844,6 +1471,7 @@ function createGroup(name) {
     createdAt: Date.now(),
   };
   state.groups.push(group);
+  resetBulk();
   state.settings.selection = { kind: 'group', id: group.id };
   state.settings.lastGroupId = group.id;
   ui.quickGroupId = group.id;
@@ -869,6 +1497,7 @@ async function deleteGroup(groupId) {
   });
   if (!confirmed) return;
 
+  resetBulk();
   const snapshot = {
     group: JSON.parse(JSON.stringify(group)),
     tasks: JSON.parse(JSON.stringify(groupTasks)),
@@ -889,6 +1518,7 @@ async function deleteGroup(groupId) {
     onAction: () => {
       state.groups.splice(Math.min(snapshot.index, state.groups.length), 0, snapshot.group);
       state.tasks.push(...snapshot.tasks);
+      resetBulk();
       state.settings.selection = { kind: 'group', id: snapshot.group.id };
       markDirty();
       render();
@@ -943,6 +1573,239 @@ function moveTaskToGroup(taskId, groupId) {
   markDirty();
   render();
   toast(`המשימה הועברה לקבוצה “${group.name}”`);
+}
+
+/* ------------------------------------------------------------------ */
+/* Records (פנקס רשומות)                                               */
+/* ------------------------------------------------------------------ */
+
+/** Index in the flat records array right after a record's whole subtree. */
+function recordInsertionIndex(parentId) {
+  if (!parentId) return 0;
+  const subtree = new Set(recordSubtreeIds(parentId));
+  let last = -1;
+  state.records.forEach((record, index) => {
+    if (subtree.has(record.id)) last = index;
+  });
+  return last >= 0 ? last + 1 : state.records.length;
+}
+
+function addRecord({ title, body, focus, parentId = null } = {}) {
+  const titleClean = String(title || '').trim();
+  const bodyClean = String(body || '').trim();
+  if (!titleClean && !bodyClean && !focus) return null;
+
+  let parent = null;
+  if (parentId) {
+    parent = findRecord(parentId);
+    if (!parent) return null;
+    if (recordDepth(parent) + 1 >= RECORD_MAX_LEVELS) {
+      toast(`אפשר לקנן עד ${RECORD_MAX_LEVELS} רמות של רשומות`);
+      return null;
+    }
+  }
+
+  // A brand-new record must be visible: an active filter would hide it (and the
+  // editor would never appear), so adding a record clears the search.
+  if (ui.search.trim()) {
+    ui.search = '';
+    const searchEl = $('#search');
+    if (searchEl) searchEl.value = '';
+  }
+
+  const timestamp = Date.now();
+  const record = {
+    id: uid(),
+    parentId: parent ? parent.id : null,
+    title: titleClean.slice(0, 300),
+    body: bodyClean.slice(0, 20_000),
+    color: RECORD_COLORS[state.records.length % RECORD_COLORS.length],
+    pinned: false,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  };
+  state.records.splice(recordInsertionIndex(record.parentId), 0, record);
+  if (parent) {
+    parent.updatedAt = timestamp;
+    ui.collapsedRecordChildren.delete(parent.id);
+  }
+  resetBulk();
+  state.settings.selection = { kind: 'records' };
+  ui.expandedRecords.add(record.id);
+  markDirty();
+  render(focus ? { focusKey: `rtitle-${record.id}` } : undefined);
+  return record;
+}
+
+function toggleRecordExpand(recordId) {
+  if (ui.expandedRecords.has(recordId)) ui.expandedRecords.delete(recordId);
+  else ui.expandedRecords.add(recordId);
+  render();
+}
+
+function toggleRecordChildren(recordId) {
+  // While filtering, branches are force-expanded; toggling would silently flip
+  // state that only becomes visible after the filter is cleared.
+  if (ui.search.trim()) return;
+  if (ui.collapsedRecordChildren.has(recordId)) ui.collapsedRecordChildren.delete(recordId);
+  else ui.collapsedRecordChildren.add(recordId);
+  render();
+}
+
+function toggleRecordPin(recordId) {
+  const record = findRecord(recordId);
+  if (!record) return;
+  record.pinned = !record.pinned;
+  record.updatedAt = Date.now();
+  markDirty();
+  render();
+}
+
+function setRecordColor(recordId, color) {
+  const record = findRecord(recordId);
+  if (!record) return;
+  record.color = color;
+  record.updatedAt = Date.now();
+  markDirty();
+  render();
+}
+
+/**
+ * True when `recordId` (with its whole subtree) fits under `parentId` without
+ * creating a cycle or exceeding the nesting limit.
+ */
+function canNestRecordUnder(recordId, parentId) {
+  const record = findRecord(recordId);
+  const parent = findRecord(parentId);
+  if (!record || !parent || record.id === parent.id) return false;
+  const subtreeIds = recordSubtreeIds(record.id);
+  if (subtreeIds.includes(parent.id)) return false;
+  const baseDepth = recordDepth(record);
+  let deepest = baseDepth;
+  for (const id of subtreeIds) {
+    const node = findRecord(id);
+    if (node) deepest = Math.max(deepest, recordDepth(node));
+  }
+  return recordDepth(parent) + 1 + (deepest - baseDepth) < RECORD_MAX_LEVELS;
+}
+
+/**
+ * Moves a record (with its whole subtree) under another record, or back to the
+ * top level when newParentId is falsy. Returns false and toasts on an invalid
+ * move (into itself / its own sub-record, or beyond the nesting limit).
+ */
+function moveRecord(recordId, newParentId = null) {
+  const record = findRecord(recordId);
+  if (!record) return false;
+  const parentId = newParentId || null;
+  if (recordParentId(record) === parentId) return false;
+
+  if (parentId) {
+    const parent = findRecord(parentId);
+    if (!parent) return false;
+    if (parent.id === record.id || recordSubtreeIds(record.id).includes(parent.id)) {
+      toast('אי אפשר להעביר רשומה לתוך תת־רשומה של עצמה');
+      return false;
+    }
+    if (!canNestRecordUnder(record.id, parent.id)) {
+      toast(`אפשר לקנן עד ${RECORD_MAX_LEVELS} רמות של רשומות`);
+      return false;
+    }
+    parent.updatedAt = Date.now();
+    ui.collapsedRecordChildren.delete(parent.id);
+  }
+
+  record.parentId = parentId;
+  record.updatedAt = Date.now();
+
+  // Keep the flat array in tree order so exports and undos stay readable.
+  const moving = new Set(recordSubtreeIds(record.id));
+  const moved = state.records.filter((item) => moving.has(item.id));
+  state.records = state.records.filter((item) => !moving.has(item.id));
+  state.records.splice(recordInsertionIndex(parentId), 0, ...moved);
+
+  markDirty();
+  render();
+  toast(parentId ? 'הרשומה עברה להיות תת־רשומה' : 'הרשומה הוצאה לרמה הראשית');
+  return true;
+}
+
+function duplicateRecord(recordId) {
+  const source = findRecord(recordId);
+  if (!source) return;
+  const subtree = recordSubtreeIds(recordId);
+  const idMap = new Map(subtree.map((id) => [id, uid()]));
+  const timestamp = Date.now();
+  const copies = [];
+  for (const id of subtree) {
+    const original = findRecord(id);
+    if (!original) continue;
+    const originalParentId = recordParentId(original);
+    copies.push({
+      id: idMap.get(original.id),
+      parentId: originalParentId && idMap.has(originalParentId) ? idMap.get(originalParentId) : originalParentId,
+      title: (original.id === recordId ? `${original.title} (עותק)` : original.title).slice(0, 300),
+      body: original.body,
+      color: original.color,
+      pinned: original.id === recordId ? false : original.pinned,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    });
+  }
+  const lastIndex = Math.max(...subtree.map((id) => state.records.findIndex((item) => item.id === id)));
+  state.records.splice(lastIndex + 1, 0, ...copies);
+  markDirty();
+  render();
+  toast(subtree.length > 1 ? 'הרשומה שוכפלה יחד עם תתי־הרשומות שלה' : 'הרשומה שוכפלה');
+}
+
+async function deleteRecord(recordId) {
+  const record = findRecord(recordId);
+  if (!record) return;
+  const subtree = recordSubtreeIds(recordId);
+  const nested = Math.max(0, subtree.length - 1);
+  const nestedPhrase = nested === 1
+    ? 'תת־רשומה אחת שמקוננת בה'
+    : `${nested} תתי־רשומות שמקוננות בה`;
+  const confirmed = await askConfirm({
+    title: nested ? 'מחיקת רשומה עם תתי־רשומות' : 'מחיקת רשומה',
+    body: nested
+      ? `למחוק את הרשומה “${record.title || 'ללא כותרת'}” ואת ${nestedPhrase}?`
+      : `למחוק את הרשומה “${record.title || 'ללא כותרת'}”?`,
+    confirmText: 'מחיקה',
+  });
+  if (!confirmed) return;
+
+  const subtreeSet = new Set(subtree);
+  const expandedSnapshot = subtree.filter((id) => ui.expandedRecords.has(id));
+  const collapsedSnapshot = subtree.filter((id) => ui.collapsedRecordChildren.has(id));
+  const removed = [];
+  state.records.forEach((item, index) => {
+    if (subtreeSet.has(item.id)) removed.push({ index, item: JSON.parse(JSON.stringify(item)) });
+  });
+  state.records = state.records.filter((item) => !subtreeSet.has(item.id));
+  subtree.forEach((id) => {
+    ui.expandedRecords.delete(id);
+    ui.collapsedRecordChildren.delete(id);
+  });
+  markDirty();
+  render();
+  toast(nested ? `הרשומה נמחקה יחד עם ${recordChildCountLabel(nested)}` : 'הרשומה נמחקה', {
+    actionLabel: 'ביטול',
+    duration: 7000,
+    onAction: () => {
+      removed
+        .sort((a, b) => a.index - b.index)
+        .forEach(({ index, item }) => {
+          state.records.splice(Math.min(index, state.records.length), 0, item);
+        });
+      expandedSnapshot.forEach((id) => ui.expandedRecords.add(id));
+      collapsedSnapshot.forEach((id) => ui.collapsedRecordChildren.add(id));
+      markDirty();
+      render();
+      toast('הרשומה שוחזרה');
+    },
+  });
 }
 
 /* ------------------------------------------------------------------ */
@@ -1113,6 +1976,45 @@ function openGroupMenu(group, anchor) {
   ]);
 }
 
+function openRecordMenu(record, anchor) {
+  const nested = recordNestedCount(record.id);
+  const canNest = recordDepth(record) + 1 < RECORD_MAX_LEVELS;
+  const items = [
+    ...(canNest
+      ? [{ key: 'add-child', label: '＋ תת־רשומה חדשה', icon: '＋', run: () => addRecord({ parentId: record.id, focus: true }) }]
+      : []),
+    {
+      key: 'pin',
+      label: recordParentId(record)
+        ? (record.pinned ? 'הסרת הצמדה בין תתי־הרשומות' : 'הצמדה בין תתי־הרשומות')
+        : (record.pinned ? 'הסרת הצמדה' : 'הצמדה למעלה'),
+      icon: '📌',
+      run: () => toggleRecordPin(record.id),
+    },
+    { key: 'duplicate', label: nested ? 'שכפול רשומה עם תתי־הרשומות' : 'שכפול רשומה', icon: '⧉', run: () => duplicateRecord(record.id) },
+    { key: 'rename', label: 'עריכת כותרת', icon: '✎', run: () => { ui.expandedRecords.add(record.id); render({ focusKey: `rtitle-${record.id}` }); } },
+    ...(recordParentId(record)
+      ? [{ key: 'unparent', label: 'הוצאה לרמה הראשית', icon: '↥', run: () => moveRecord(record.id, null) }]
+      : []),
+    { type: 'sep' },
+    {
+      key: 'delete',
+      label: nested ? 'מחיקת רשומה עם תתי־הרשומות' : 'מחיקת רשומה',
+      icon: '✕',
+      danger: true,
+      run: () => deleteRecord(record.id),
+    },
+  ];
+  openPopup(anchor, items);
+}
+
+function openRecordColor(record, anchor) {
+  openPopup(anchor, [
+    { type: 'label', label: 'צבע הרשומה' },
+    { type: 'colors', colors: RECORD_COLORS, selected: record.color, onPick: (color) => setRecordColor(record.id, color) },
+  ]);
+}
+
 /* ------------------------------------------------------------------ */
 /* Confirm dialog                                                      */
 /* ------------------------------------------------------------------ */
@@ -1224,6 +2126,9 @@ async function importData() {
     }
     state = result.data;
     ui.expanded.clear();
+    ui.expandedRecords.clear();
+    ui.collapsedRecordChildren.clear();
+    resetBulk();
     ui.search = '';
     const search = $('#search');
     if (search) search.value = '';
@@ -1248,12 +2153,15 @@ function openDataFolder() {
 function clearDropHints() {
   $$('.task.drop-before, .task.drop-after').forEach((el) => el.classList.remove('drop-before', 'drop-after'));
   $$('.group-row.drop-target').forEach((el) => el.classList.remove('drop-target'));
+  $$('.record.drop-inside').forEach((el) => el.classList.remove('drop-inside'));
 }
 
 function cleanupDrag() {
   dragTaskId = null;
+  dragRecordId = null;
   clearDropHints();
   $$('.task.dragging').forEach((el) => el.classList.remove('dragging'));
+  $$('.record.dragging').forEach((el) => el.classList.remove('dragging'));
 }
 
 /* ------------------------------------------------------------------ */
@@ -1266,7 +2174,9 @@ function handleClick(event) {
 
   if (ui.popup && !ui.popup.contains(target)
       && !target.closest('[data-act="task-menu"]')
-      && !target.closest('[data-act="group-menu"]')) {
+      && !target.closest('[data-act="group-menu"]')
+      && !target.closest('[data-act="record-menu"]')
+      && !target.closest('[data-act="record-color"]')) {
     closePopup();
   }
 
@@ -1277,9 +2187,10 @@ function handleClick(event) {
     if (selectable) {
       const raw = selectable.dataset.select || '';
       const separator = raw.indexOf(':');
-      const kind = raw.slice(0, separator);
-      const id = raw.slice(separator + 1);
-      if (kind === 'view' || kind === 'group') setSelection({ kind, id });
+      const kind = separator >= 0 ? raw.slice(0, separator) : raw;
+      const id = separator >= 0 ? raw.slice(separator + 1) : '';
+      if (kind === 'records') setSelection({ kind: 'records' });
+      else if (kind === 'view' || kind === 'group') setSelection({ kind, id });
     }
     return;
   }
@@ -1287,8 +2198,16 @@ function handleClick(event) {
   const taskEl = actionEl.closest('.task');
   const taskId = taskEl ? taskEl.dataset.taskId : null;
   const task = taskId ? findTask(taskId) : null;
+  const recordEl = actionEl.closest('.record');
+  const recordId = recordEl ? recordEl.dataset.recordId : null;
+  const record = recordId ? findRecord(recordId) : null;
 
   switch (action) {
+    case 'bulk-item': {
+      if (ui.bulk.active && ui.bulk.kind === 'tasks' && task) toggleBulkItem('tasks', task.id);
+      else if (ui.bulk.active && ui.bulk.kind === 'records' && record) toggleBulkItem('records', record.id);
+      break;
+    }
     case 'toggle-task':
       if (task) toggleTask(task.id);
       break;
@@ -1332,6 +2251,33 @@ function handleClick(event) {
       if (group) openGroupMenu(group, actionEl);
       break;
     }
+    case 'record-expand':
+      if (record) toggleRecordExpand(record.id);
+      break;
+    case 'record-children':
+      if (record) toggleRecordChildren(record.id);
+      break;
+    case 'record-add-child':
+      if (record) addRecord({ parentId: record.id, focus: true });
+      break;
+    case 'record-edit-title':
+      if (record) {
+        ui.expandedRecords.add(record.id);
+        render({ focusKey: `rtitle-${record.id}` });
+      }
+      break;
+    case 'record-menu':
+      if (record) openRecordMenu(record, actionEl);
+      break;
+    case 'record-pin':
+      if (record) toggleRecordPin(record.id);
+      break;
+    case 'record-color':
+      if (record) openRecordColor(record, actionEl);
+      break;
+    case 'delete-record':
+      if (record) deleteRecord(record.id);
+      break;
     default:
       break;
   }
@@ -1340,6 +2286,7 @@ function handleClick(event) {
 function handleDblClick(event) {
   const target = event.target;
   if (!(target instanceof Element)) return;
+  if (ui.bulk.active) return;
 
   const subtaskTitle = target.closest('.subtask-title');
   if (subtaskTitle) {
@@ -1373,12 +2320,32 @@ function handleInput(event) {
 
   if (target.id === 'search') {
     ui.search = target.value;
+    // A filter change would leave previously selected rows out of sight —
+    // clearing the selection keeps "what you see" and "what gets deleted" aligned.
+    if (ui.bulk.active) ui.bulk.ids.clear();
     render();
     return;
   }
 
   const role = target.dataset.role;
   if (!role) return;
+
+  const recordEl = target.closest('.record');
+  if (recordEl) {
+    const record = findRecord(recordEl.dataset.recordId);
+    if (!record) return;
+    if (role === 'record-title') {
+      record.title = target.value;
+      record.updatedAt = Date.now();
+      markDirty();
+    } else if (role === 'record-body') {
+      record.body = target.value;
+      record.updatedAt = Date.now();
+      markDirty();
+    }
+    return;
+  }
+
   const taskEl = target.closest('.task');
   const task = taskEl ? findTask(taskEl.dataset.taskId) : null;
   if (!task) return;
@@ -1399,7 +2366,11 @@ function handleChange(event) {
   if (!(target instanceof HTMLElement)) return;
 
   if (target.id === 'sort') {
-    state.settings.sort = target.value;
+    if (activeSelection().kind === 'records') {
+      state.settings.recordsSort = target.value;
+    } else {
+      state.settings.sort = target.value;
+    }
     markDirty();
     render();
     return;
@@ -1445,6 +2416,11 @@ function handleKeyDown(event) {
 
   if (modifier && !event.altKey) {
     const key = event.key.toLowerCase();
+    if (key === 'a' && ui.bulk.active && !isEditing) {
+      event.preventDefault();
+      toggleBulkAll();
+      return;
+    }
     if (key === 'n' && event.shiftKey) {
       event.preventDefault();
       showNewGroupForm();
@@ -1452,6 +2428,7 @@ function handleKeyDown(event) {
     }
     if (key === 'n') {
       event.preventDefault();
+      if (activeSelection().kind === 'records') setSelection({ kind: 'view', id: 'all' });
       const input = $('#quick-add-input');
       if (input) input.focus();
       return;
@@ -1471,10 +2448,17 @@ function handleKeyDown(event) {
     }
   }
 
+  if (event.key === 'Delete' && ui.bulk.active && !isEditing && ui.bulk.ids.size) {
+    event.preventDefault();
+    bulkDeleteSelected();
+    return;
+  }
+
   if (event.key === 'Escape') {
     if (document.body.classList.contains('nav-open')) { closeNav(); return; }
     if (ui.popup) { closePopup(); return; }
     if (ui.confirmResolve) { settleConfirm(false); return; }
+    if (ui.bulk.active) { event.preventDefault(); exitBulkMode(); return; }
     if (!$('#new-group-form').classList.contains('hidden')) { hideNewGroupForm(); return; }
     const search = $('#search');
     if (document.activeElement === search && search.value) {
@@ -1499,6 +2483,14 @@ function handleKeyDown(event) {
     if (target instanceof HTMLElement && target.dataset.role === 'title') {
       event.preventDefault();
       target.blur();
+      return;
+    }
+    if (target instanceof HTMLElement && target.dataset.role === 'record-title') {
+      event.preventDefault();
+      const details = target.closest('.record-details');
+      const bodyEl = details && details.querySelector('[data-role="record-body"]');
+      if (bodyEl) bodyEl.focus();
+      else target.blur();
       return;
     }
     if (target instanceof HTMLElement && target.id === 'quick-add-input') {
@@ -1528,6 +2520,17 @@ function handleSubmit(event) {
     return;
   }
 
+  if (form.id === 'record-quick-add-form') {
+    event.preventDefault();
+    const input = $('#record-quick-add-input');
+    const title = input.value.trim();
+    if (!title) { input.focus(); return; }
+    addRecord({ title });
+    input.value = '';
+    input.focus();
+    return;
+  }
+
   if (form.id === 'new-group-form') {
     event.preventDefault();
     const input = $('#new-group-input');
@@ -1540,6 +2543,31 @@ function handleSubmit(event) {
 function handleDragStart(event) {
   const target = event.target;
   if (!(target instanceof Element)) return;
+
+  // Records can be dragged onto another record to become its sub-record.
+  const recordCard = target.closest('.record');
+  if (recordCard) {
+    // Let normal text selection / text dragging win inside the open editor.
+    if (target.closest('.record-details')) return;
+    const selection = window.getSelection ? window.getSelection() : null;
+    if (selection
+        && !selection.isCollapsed
+        && selection.anchorNode
+        && recordCard.contains(selection.anchorNode)
+        && String(selection).trim()) return;
+    if (ui.bulk.active || recordCard.getAttribute('draggable') === 'false') {
+      event.preventDefault();
+      return;
+    }
+    dragRecordId = recordCard.dataset.recordId;
+    recordCard.classList.add('dragging');
+    try {
+      event.dataTransfer.effectAllowed = 'move';
+      event.dataTransfer.setData('text/plain', dragRecordId);
+    } catch { /* ignore */ }
+    return;
+  }
+
   const card = target.closest('.task');
   if (!card || card.getAttribute('draggable') === 'false') {
     event.preventDefault();
@@ -1554,9 +2582,24 @@ function handleDragStart(event) {
 }
 
 function handleDragOver(event) {
-  if (!dragTaskId) return;
+  if (!dragTaskId && !dragRecordId) return;
   const target = event.target;
   if (!(target instanceof Element)) return;
+
+  if (dragRecordId) {
+    clearDropHints();
+    const recordCard = target.closest('.record');
+    const sourceRecord = findRecord(dragRecordId);
+    if (recordCard
+        && recordCard.dataset.recordId !== dragRecordId
+        && recordParentId(sourceRecord) !== recordCard.dataset.recordId
+        && canNestRecordUnder(dragRecordId, recordCard.dataset.recordId)) {
+      event.preventDefault();
+      try { event.dataTransfer.dropEffect = 'move'; } catch { /* ignore */ }
+      recordCard.classList.add('drop-inside');
+    }
+    return;
+  }
 
   const card = target.closest('.task');
   clearDropHints();
@@ -1579,6 +2622,22 @@ function handleDragOver(event) {
 }
 
 function handleDrop(event) {
+  if (dragRecordId) {
+    const target = event.target;
+    if (!(target instanceof Element)) { cleanupDrag(); return; }
+    const recordCard = target.closest('.record');
+    if (recordCard && recordCard.dataset.recordId !== dragRecordId) {
+      event.preventDefault();
+      const sourceId = dragRecordId;
+      const targetId = recordCard.dataset.recordId;
+      cleanupDrag();
+      moveRecord(sourceId, targetId);
+      return;
+    }
+    cleanupDrag();
+    return;
+  }
+
   if (!dragTaskId) return;
   const target = event.target;
   if (!(target instanceof Element)) return;
@@ -1647,8 +2706,14 @@ function bindStaticEvents() {
 
   $('#add-task-btn').addEventListener('click', () => {
     closeNav();
+    if (activeSelection().kind === 'records') setSelection({ kind: 'view', id: 'all' });
     const input = $('#quick-add-input');
     if (input) { input.focus(); input.select(); }
+  });
+
+  $('#add-record-btn').addEventListener('click', () => {
+    closeNav();
+    addRecord({ focus: true });
   });
 
   $('#add-group-btn').addEventListener('click', () => {
@@ -1667,6 +2732,13 @@ function bindStaticEvents() {
   $('#export-btn').addEventListener('click', exportData);
   $('#import-btn').addEventListener('click', importData);
   $('#open-folder-btn').addEventListener('click', openDataFolder);
+
+  // Bulk selection (tasks and records share the bar; the kind is chosen by
+  // the active view and re-checked by every mutation).
+  $('#bulk-toggle').addEventListener('click', toggleBulkMode);
+  $('#bulk-all').addEventListener('change', toggleBulkAll);
+  $('#bulk-delete').addEventListener('click', () => { bulkDeleteSelected().catch(() => {}); });
+  $('#bulk-cancel').addEventListener('click', exitBulkMode);
 
   $('#confirm-ok').addEventListener('click', (event) => {
     event.preventDefault();
